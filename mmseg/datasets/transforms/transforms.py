@@ -28,6 +28,151 @@ except ImportError:
     Compose = None
     ALBU_INSTALLED = False
 
+from PIL import Image, ImageOps
+
+@TRANSFORMS.register_module()
+class CropTrainPC33(BaseTransform):
+    '''
+    Code source : https://github.com/zhanghang1989/PyTorch-Encoding/blob/master/encoding/datasets/base.py
+    '''
+    def __init__(self, base_size=520, crop_size=480, fill_img_value=0, fill_mask_value=255):
+        self.base_size = base_size
+        self.crop_size = crop_size
+        self.fill_img_value = fill_img_value
+        self.fill_mask_value = fill_mask_value
+
+    def _sync_transform(self, np_img, np_mask):
+        # random mirror
+        try:
+            np_img = np_img.squeeze(-1)
+        except ValueError:
+            pass      
+        img = Image.fromarray(np_img)
+        mask = Image.fromarray(np_mask)
+        if random.random() < 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+        crop_size = self.crop_size
+        #print(crop_size)
+        # random scale (short edge)
+        w, h = img.size
+        long_size = random.randint(int(self.base_size*0.5), int(self.base_size*2.0))
+        if h > w:
+            oh = long_size
+            ow = int(1.0 * w * long_size / h + 0.5)
+            short_size = ow
+        else:
+            ow = long_size
+            oh = int(1.0 * h * long_size / w + 0.5)
+            short_size = oh
+        img = img.resize((ow, oh), Image.BILINEAR)
+        mask = mask.resize((ow, oh), Image.NEAREST)
+        # pad crop
+        if short_size < crop_size:
+            padh = crop_size - oh if oh < crop_size else 0
+            padw = crop_size - ow if ow < crop_size else 0
+            img = ImageOps.expand(img, border=(0, 0, padw, padh), fill=self.fill_img_value)
+            mask = ImageOps.expand(mask, border=(0, 0, padw, padh), fill=self.fill_mask_value)
+        # random crop crop_size
+        w, h = img.size
+        x1 = random.randint(0, w - crop_size+1)
+        y1 = random.randint(0, h - crop_size+1)
+        img = img.crop((x1, y1, x1+crop_size, y1+crop_size))
+        mask = mask.crop((x1, y1, x1+crop_size, y1+crop_size))
+        #print(np.shape(img))
+        # final transform
+        return np.array(img), np.array(mask)
+
+    def transform(self, results: dict) -> dict:
+        """Transform function to randomly crop images, semantic segmentation
+        maps according to the needs of Pascal Context
+
+        Args:
+            results (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Randomly cropped results, 'img_shape' key in result dict is
+                updated according to crop size.
+        """
+        # crop the image and segmap
+        img = results['img']
+        seg_map = results['gt_seg_map']
+        img, mask = self._sync_transform(img, seg_map)
+        results['img'] = img
+        results['img_shape'] = results['img'].shape[:2]
+
+        results['gt_seg_map'] = mask
+        return results
+
+    def __repr__(self):
+        return self.__class__.__name__ + f'(crop_size={self.crop_size})'
+
+
+@TRANSFORMS.register_module()
+class CropValPC33(BaseTransform):
+    '''
+    Code source : https://github.com/zhanghang1989/PyTorch-Encoding/blob/master/encoding/datasets/base.py
+    '''
+    def __init__(self, base_size=520, crop_size=480, fill_img_value=0, fill_mask_value=255):
+        self.base_size = base_size
+        self.crop_size = crop_size
+        self.fill_img_value = fill_img_value
+        self.fill_mask_value = fill_mask_value
+
+
+    def _val_sync_transform(self, np_img, np_mask):
+        try:
+            np_img = np_img.squeeze(-1)
+        except ValueError:
+            pass 
+        img = Image.fromarray(np_img)
+        mask = Image.fromarray(np_mask,mode="L")
+        outsize = self.crop_size
+        short_size = outsize
+        w, h = img.size
+        if w > h:
+            oh = short_size
+            ow = int(1.0 * w * oh / h)
+        else:
+            ow = short_size
+            oh = int(1.0 * h * ow / w)
+        img = img.resize((ow, oh), Image.BILINEAR)
+        mask = mask.resize((ow, oh), Image.NEAREST)
+        # center crop
+        w, h = img.size
+        x1 = int(round((w - outsize) / 2.))
+        y1 = int(round((h - outsize) / 2.))
+        img = img.crop((x1, y1, x1+outsize, y1+outsize))
+        mask = mask.crop((x1, y1, x1+outsize, y1+outsize))
+        # final transform
+        return np.array(img), np.array(mask)
+
+    def transform(self, results: dict) -> dict:
+        """Transform function to randomly crop images, semantic segmentation
+        maps according to the needs of Pascal Context
+
+        Args:
+            results (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Randomly cropped results, 'img_shape' key in result dict is
+                updated according to crop size.
+        """
+        # crop the image and segmap
+        img = results['img']
+        seg_map = results['gt_seg_map']
+        if len(seg_map.shape) > 2: 
+            seg_map = seg_map[:,:,0]
+        img, mask = self._val_sync_transform(img, seg_map)
+        results['img'] = img
+        results['img_shape'] = results['img'].shape[:2]
+
+        results['gt_seg_map'] = mask
+        return results
+
+    def __repr__(self):
+        return self.__class__.__name__ + f'(crop_size={self.crop_size})'
+
 
 @TRANSFORMS.register_module()
 class ResizeToMultiple(BaseTransform):
@@ -2535,3 +2680,151 @@ class RandomDepthMix(BaseTransform):
 
         results['img'] = img
         return results
+
+@TRANSFORMS.register_module()
+class RGBGaussianBlur(BaseTransform):
+    """Add Gaussian blur with random sigma to RGB images.
+    
+    Required Keys:
+    - img (np.ndarray): RGB image with shape (H, W, C), 
+        where C=3 for RGB images.
+
+    Modified Keys:
+    - img
+
+    Args:
+        sigma_range (Tuple[float, float]): Range to randomly
+            select sigma value. Default to (0.1, 2.0).
+        prob (float): Probability to apply Gaussian blur. Default to 0.5.
+        per_channel (bool): Whether to apply different blur to each 
+            RGB channel. Default to False.
+    """
+
+    def __init__(self,
+                 sigma_range: Tuple[float, float] = (0.1, 2.0),
+                 prob: float = 0.5,
+                 per_channel: bool = False) -> None:
+        super().__init__()
+        assert 0.0 <= prob <= 1.0
+        assert isinstance(sigma_range, Sequence) and len(sigma_range) == 2
+        self.sigma_range = sigma_range
+        self.prob = prob
+        self.per_channel = per_channel
+
+    def _get_random_sigma(self) -> float:
+        """Generate random sigma value from range."""
+        return np.random.uniform(self.sigma_range[0], self.sigma_range[1])
+
+    def _gaussian_blur(self, img: np.ndarray) -> np.ndarray:
+        """Apply Gaussian blur to the image.
+        
+        Args:
+            img (np.ndarray): Input image with shape (H, W, C)
+        Returns:
+            np.ndarray: Blurred image
+        """
+        if self.per_channel:
+            # Apply different blur to each channel
+            for c in range(img.shape[2]):
+                sigma = self._get_random_sigma()
+                img[..., c] = gaussian_filter(img[..., c], sigma)
+        else:
+            # Apply same blur across all channels
+            sigma = self._get_random_sigma()
+            img = gaussian_filter(img, sigma)
+        return img
+
+    def transform(self, results: Dict) -> Dict:
+        """Apply random Gaussian blur to image.
+
+        Args:
+            results (dict): Result dict with image.
+
+        Returns:
+            dict: Result dict with blurred image.
+        """
+        if np.random.rand() < self.prob:
+            results['img'] = self._gaussian_blur(results['img'])
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(prob={self.prob}, '
+        repr_str += f'sigma_range={self.sigma_range}, '
+        repr_str += f'per_channel={self.per_channel})'
+        return repr_str
+    
+@TRANSFORMS.register_module()
+class RGBGaussianNoise(BaseTransform):
+    """Add random Gaussian noise to RGB images.
+    
+    This transform is specifically designed for RGB images in the Cityscapes dataset.
+    
+    Required Keys:
+    - img (np.ndarray): RGB image with shape (H, W, C), 
+      where H is height, W is width, and C is 3 for RGB channels
+    
+    Modified Keys:
+    - img
+    
+    Args:
+        prob (float): Probability to add Gaussian noise for each sample. 
+            Default to 0.1.
+        mean (float): Mean or "centre" of the noise distribution. Default to 0.0.
+        std (float): Standard deviation of noise distribution. Default to 0.1.
+        clip (bool): Whether to clip the noisy image values to valid range. 
+            Default to True.
+    """
+    def __init__(self,
+                 prob: float = 0.1,
+                 mean: float = 0.0,
+                 std: float = 0.1,
+                 clip: bool = True) -> None:
+        super().__init__()
+        assert 0.0 <= prob <= 1.0 and std >= 0.0
+        self.prob = prob
+        self.mean = mean
+        self.std = std
+        self.clip = clip
+    
+    def transform(self, results: Dict) -> Dict:
+        """Add random Gaussian noise to the image.
+        
+        Args:
+            results (dict): Result dict containing the image.
+        
+        Returns:
+            dict: Result dict with potentially noisy image.
+        """
+        # Check if noise should be applied based on probability
+        if np.random.rand() < self.prob:
+            # Generate random standard deviation within the specified range
+            rand_std = np.random.uniform(0, self.std)
+            
+            # Generate Gaussian noise with the same shape as the image
+            noise = np.random.normal(
+                self.mean, rand_std, size=results['img'].shape)
+            
+            # Convert noise to the same dtype as the image
+            noise = noise.astype(results['img'].dtype)
+            
+            # Add noise to the image
+            results['img'] = results['img'] + noise
+            
+            # Optionally clip values to valid range (0-255 for uint8, 0-1 for float)
+            if self.clip:
+                if np.issubdtype(results['img'].dtype, np.uint8):
+                    results['img'] = np.clip(results['img'], 0, 255).astype(np.uint8)
+                elif np.issubdtype(results['img'].dtype, np.floating):
+                    results['img'] = np.clip(results['img'], 0, 1)
+        
+        return results
+    
+    def __repr__(self):
+        """String representation of the transform."""
+        repr_str = self.__class__.__name__
+        repr_str += f'(prob={self.prob}, '
+        repr_str += f'mean={self.mean}, '
+        repr_str += f'std={self.std}, '
+        repr_str += f'clip={self.clip})'
+        return repr_str

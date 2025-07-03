@@ -20,7 +20,7 @@ optim_wrapper = dict(
         custom_keys={
             'pos_block': dict(decay_mult=0.),
             'norm': dict(decay_mult=0.),
-            'head': dict(lr_mult=10.)
+            'head': dict(lr_mult=10.) 
         }))
 
 param_scheduler = [

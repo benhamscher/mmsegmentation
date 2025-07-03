@@ -5,6 +5,7 @@ from .basesegdataset import BaseCDDataset, BaseSegDataset
 from .bdd100k import BDD100KDataset
 from .chase_db1 import ChaseDB1Dataset
 from .cityscapes import CityscapesDataset
+from .cityscapes_stylized import CityscapesStylizedDataset
 from .coco_stuff import COCOStuffDataset
 from .dark_zurich import DarkZurichDataset
 from .dataset_wrappers import MultiImageMixDataset
@@ -22,6 +23,8 @@ from .mapillary import MapillaryDataset_v1, MapillaryDataset_v2
 from .night_driving import NightDrivingDataset
 from .nyu import NYUDataset
 from .pascal_context import PascalContextDataset, PascalContextDataset59
+from .custom_PascalContext import CustomPascalContextDataset
+from .custom_PascalContextTexture import CustomPascalContextTextureDataset
 from .potsdam import PotsdamDataset
 from .refuge import REFUGEDataset
 from .stare import STAREDataset
@@ -61,5 +64,5 @@ __all__ = [
     'MapillaryDataset_v2', 'Albu', 'LEVIRCDDataset',
     'LoadMultipleRSImageFromFile', 'LoadSingleRSImageFromFile',
     'ConcatCDInput', 'BaseCDDataset', 'DSDLSegDataset', 'BDD100KDataset',
-    'NYUDataset', 'HSIDrive20Dataset'
+    'NYUDataset', 'HSIDrive20Dataset',  'CityscapesStylizedDataset', 'CustomPascalContextDataset', 'CustomPascalContextTextureDataset'
 ]
