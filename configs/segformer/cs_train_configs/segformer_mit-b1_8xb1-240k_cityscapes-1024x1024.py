@@ -170,7 +170,7 @@ test_dataloader = dict(
     batch_size=1,
     dataset=dict(
         data_prefix=dict(
-            img_path='leftImg8bit_stylized/val', seg_map_path='gtFine/val'),
+            img_path='leftImg8bit/val', seg_map_path='gtFine/val'),
         data_root='/home/maag/datasets/Cityscapes/',
         pipeline=[
             dict(type='LoadImageFromFile'),
@@ -204,8 +204,8 @@ train_dataloader = dict(
     batch_size=2, # 7 too large
     dataset=dict(
         data_prefix=dict(
-            img_path='leftImg8bit_stylized/train', seg_map_path='gtFine/train'),
-        data_root='/home/bhamscher/datasets/Cityscapes/',
+            img_path='leftImg8bit/train', seg_map_path='gtFine/train'),
+        data_root='/home/maag/datasets/Cityscapes/',
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(type='LoadAnnotations'),
@@ -288,8 +288,8 @@ val_dataloader = dict(
     batch_size=1,
     dataset=dict(
         data_prefix=dict(
-            img_path='leftImg8bit_stylized/val', seg_map_path='gtFine/val'),
-        data_root='/home/bhamscher/datasets/Cityscapes/',
+            img_path='leftImg8bit/val', seg_map_path='gtFine/val'),
+        data_root='/home/maag/datasets/Cityscapes/',
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(keep_ratio=True, scale=(
@@ -316,4 +316,4 @@ visualizer = dict(
     vis_backends=[
         dict(type='LocalVisBackend'),
     ])
-work_dir = 'work_dirs/segformer/trainings/segformer_mit-b1_8xb1-240k_cityscapes_stylized-1024x1024_batch_size_2'
+work_dir = 'work_dirs/segformer/trainings/segformer_mit-b1_8xb1-240k_cityscapes-1024x1024_batch_size_2'

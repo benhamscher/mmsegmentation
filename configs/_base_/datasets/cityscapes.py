@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'CityscapesDataset'
-data_root = 'data/cityscapes/' # Update this path to your actual dataset location
+data_root = '/home/maag/datasets/Cityscapes' # Update this path to your actual dataset location
 crop_size = (512, 1024)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
