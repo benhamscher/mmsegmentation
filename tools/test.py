@@ -5,7 +5,10 @@ import os.path as osp
 
 from mmengine.config import Config, DictAction
 from mmengine.runner import Runner
-
+import time
+import torch
+torch.cuda.empty_cache()
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:24"
 
 # TODO: support fuse_conv_bn, visualization, and format_only
 def parse_args():
@@ -47,6 +50,19 @@ def parse_args():
         help='job launcher')
     parser.add_argument(
         '--tta', action='store_true', help='Test time augmentation')
+    
+    parser.add_argument('-it', '--iterations', type=int, default=3,
+                        help='number of iterations for adversarial attack')
+    parser.add_argument('-at', '--attack', type=str, default='cospgd', choices={'fgsm', 'cospgd', 'segpgd', 'pgd', 'apgd', 'no_attack'},
+                        help='Which adversarial attack')
+    parser.add_argument('-ep', '--epsilon', type=float, default=8,
+                        help='number of iterations for adversarial attack')
+    parser.add_argument('-a', '--alpha', type=float, default=2.55,
+                        help='number of iterations for adversarial attack')
+    parser.add_argument('-nr', '--norm', type=str, default="linf", choices={'linf', 'l2', 'l1'},
+                        help='lipschitz continuity bound to use')
+    parser.add_argument('--perform_attack', action='store_true')
+    
     # When using PyTorch version >= 2.0.0, the `torch.distributed.launch`
     # will pass the `--local-rank` parameter to `tools/train.py` instead
     # of `--local_rank`.
@@ -86,8 +102,13 @@ def main():
     cfg = Config.fromfile(args.config)
     cfg.launcher = args.launcher
     if args.cfg_options is not None:
-        cfg.merge_from_dict(args.cfg_options)
+        cfg.merge_from_dict(args.cfg_options)    
 
+    #import ipdb;ipdb.set_trace()
+    if args.perform_attack:
+        cfg['model']['perform_attack'] = True
+        cfg['model']['attack_cfg'] = dict(norm=args.norm, name=args.attack, iterations=args.iterations, epsilon=args.epsilon, alpha=args.alpha)
+    
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
         # update configs according to CLI args if args.work_dir is not None
@@ -116,7 +137,11 @@ def main():
     runner = Runner.from_cfg(cfg)
 
     # start testing
+    start_time = time.time()
     runner.test()
+    end_time = time.time()
+    time_taken = end_time - start_time
+    print("\n\nTOTAL TIME:\tMinutes:{} and Seconds{}\n\tONLY IN SECONDS:{}".format(time_taken/60,time_taken%60,time_taken))
 
 
 if __name__ == '__main__':

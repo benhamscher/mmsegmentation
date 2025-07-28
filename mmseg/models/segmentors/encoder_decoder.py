@@ -1,16 +1,29 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import logging
 from typing import List, Optional
+import os
 
 import torch.nn as nn
 import torch.nn.functional as F
 from mmengine.logging import print_log
+import torch
 from torch import Tensor
+import torchvision
+from adversarial_attacks.cospgd_class import Attack
+from PIL import Image
 
 from mmseg.registry import MODELS
 from mmseg.utils import (ConfigType, OptConfigType, OptMultiConfig,
                          OptSampleList, SampleList, add_prefix)
 from .base import BaseSegmentor
+
+from mmseg.models.utils import resize
+
+import os
+import numpy as np
+
+import math
+
 
 
 @MODELS.register_module()
@@ -79,7 +92,11 @@ class EncoderDecoder(BaseSegmentor):
                  test_cfg: OptConfigType = None,
                  data_preprocessor: OptConfigType = None,
                  pretrained: Optional[str] = None,
-                 init_cfg: OptMultiConfig = None):
+                 init_cfg: OptMultiConfig = None,
+                 attack_loss: ConfigType=None,
+                 attack_cfg: ConfigType=None,
+                 normalize_mean_std: ConfigType=None,
+                 perform_attack: bool=True):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         if pretrained is not None:
@@ -94,6 +111,16 @@ class EncoderDecoder(BaseSegmentor):
 
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.attack_cfg = attack_cfg
+        self.attack_loss = attack_loss
+        self.criterion = MODELS.build(self.attack_loss) 
+        self.perform_attack=perform_attack
+        
+        self.mean=normalize_mean_std['mean']
+        self.std=normalize_mean_std['std']
+        self.counter=0
+        
+        #self.normalize = torchvision.transforms.Normalize(mean = normalize_mean_std['mean'], std=normalize_mean_std['std'])
 
         assert self.with_decode_head
 
@@ -158,6 +185,232 @@ class EncoderDecoder(BaseSegmentor):
 
         return losses
 
+    def segpgd_scale(
+            self,
+            predictions,
+            labels,
+            loss,
+            iteration,
+            iterations,
+            targeted=False,
+        ):
+        lambda_t = iteration/(2*iterations)
+        output_idx = torch.argmax(predictions, dim=1)
+        if targeted:
+            loss = torch.sum(
+                torch.where(
+                    output_idx == labels,
+                    lambda_t*loss,
+                    (1-lambda_t)*loss
+                )
+            ) / (predictions.shape[-2]*predictions.shape[-1])
+        else:
+            loss = torch.sum(
+                torch.where(
+                    output_idx == labels,
+                    (1-lambda_t)*loss,
+                    lambda_t*loss
+                )
+            ) / (predictions.shape[-2]*predictions.shape[-1])
+        return loss
+    
+    def cospgd_scale(
+            self,
+            predictions,
+            labels,
+            loss,
+            num_classes=None,
+            targeted=False,
+            one_hot=True,
+        ):
+        if one_hot:
+            transformed_target = torch.nn.functional.one_hot(
+                torch.clamp(labels, 0, num_classes-1),
+                num_classes = num_classes
+            ).permute(0,3,1,2)
+        else:
+            transformed_target = torch.nn.functional.softmax(labels, dim=1)
+        #import ipdb;ipdb.set_trace()
+        cossim = torch.nn.functional.cosine_similarity(
+            torch.nn.functional.softmax(predictions, dim=1),
+            transformed_target,
+            dim = 1
+        )
+        if targeted:
+            cossim = 1 - cossim # if performing targeted attacks, we want to punish for dissimilarity to the target        
+        
+        del transformed_target
+        del predictions
+        torch.cuda.empty_cache()
+        
+        return cossim.detach()        
+
+    def apgd(
+            self,
+            model,
+            normalize_inputs,
+            batch_img_metas,
+            data_samples,
+            n_iter,
+            x,
+            y,
+            device,
+            eps,
+            criterion_indiv = torch.nn.CrossEntropyLoss(ignore_index=255, reduction='none'),
+        ):
+        
+        def normalize(x, ndims):
+            t = x.abs().view(x.shape[0], -1).max(1)[0]
+            return x / (t.view(-1, *([1] * ndims)) + 1e-12)
+        
+        def check_oscillation(x, j, k, y5, device, k3=0.75):
+            t = torch.zeros(x.shape[1]).to(device)
+            for counter5 in range(k):
+                t += (x[j - counter5] > x[j - counter5 - 1]).float()
+
+            return (t <= k * k3 * torch.ones_like(t)).float()
+        
+        n_iter_2 = max(int(0.22 * n_iter), 1)
+        n_iter_min = max(int(0.06 * n_iter), 1)
+        size_decr = max(int(0.03 * n_iter), 1)
+        
+        thr_decr = 0.75
+        
+        
+        orig_dim = list(x.shape[1:])
+        ndims = len(orig_dim)
+        
+        t = 2 * torch.rand(x.shape).to(device).detach() - 1
+        x_adv = x + eps * torch.ones_like(x).detach() * normalize(t, ndims)
+        
+        x_adv = x_adv.clamp(0., 1.)
+        x_best = x_adv.clone()
+        x_best_adv = x_adv.clone()
+        loss_steps = torch.zeros(
+            [n_iter, x.shape[0]]
+        ).to(device)
+        loss_best_steps = torch.zeros(
+            [n_iter + 1, x.shape[0]]
+        ).to(device)
+        # acc_steps = torch.zeros_like(loss_best_steps)
+        
+        x_adv.requires_grad_()
+        grad = torch.zeros_like(x)
+        with torch.enable_grad():
+            #logits = model(x_adv)
+            #loss_indiv = criterion_indiv(logits, y)
+            #seg_logits = self.inference(normalize_inputs(x_adv), batch_img_metas)
+            loss_indiv = self.loss(normalize_inputs(x_adv*255), data_samples)['decode.loss_ce']
+            loss = loss_indiv.sum()
+            grad = torch.autograd.grad(loss, [x_adv])[0].detach()
+        
+        grad_best = grad.clone()
+        
+        # acc = logits.detach().max(1)[1] == y
+        # acc_steps[0] = acc.mean()
+        loss_best = loss_indiv.detach().view(len(loss_indiv),-1).mean(dim=1)
+        
+        alpha = 2.
+        
+        step_size = alpha * eps * torch.ones(
+            [x.shape[0], *([1] * ndims)]
+        ).to(device).detach()
+        x_adv_old = x_adv.clone()
+        
+        counter = 0
+        k = n_iter_2
+        n_fts = math.prod(orig_dim)
+        counter3 = 0
+        
+        loss_best_last_check = loss_best.clone()
+        reduced_last_check = torch.ones_like(loss_best)
+        n_reduced = 0
+        
+        u = torch.arange(x.shape[0], device=device)
+        for i in range(n_iter):
+            ### gradient step
+            with torch.no_grad():
+                x_adv = x_adv.detach()
+                grad2 = x_adv - x_adv_old
+                x_adv_old = x_adv.clone()
+                
+                a = 0.75 if i > 0 else 1.0
+                
+                x_adv_1 = x_adv + step_size * torch.sign(grad)
+                x_adv_1 = torch.clamp(
+                    torch.min(
+                        torch.max(x_adv_1, x - eps),
+                        x + eps
+                    ), 0.0, 1.0
+                )
+                x_adv_1 = torch.clamp(
+                    torch.min(
+                        torch.max(
+                            x_adv + (x_adv_1 - x_adv) * a + grad2 * (1 - a),
+                            x - eps
+                        ), x + eps
+                    ), 0.0, 1.0
+                )
+                
+                x_adv = x_adv_1 + 0.
+            
+            ### get grad
+            x_adv.requires_grad_()
+            grad = torch.zeros_like(x)
+            with torch.enable_grad():
+                #logits = model(x_adv)
+                #loss_indiv = criterion_indiv(logits, y)
+                #seg_logits = self.inference(normalize_inputs(x_adv), batch_img_metas)
+                loss_indiv = self.loss(normalize_inputs(x_adv*255), data_samples)['decode.loss_ce']
+                loss = loss_indiv.sum()
+
+                grad = torch.autograd.grad(loss, [x_adv])[0].detach()
+            
+            # pred = logits.detach().max(1)[1] == y
+            # acc = torch.min(acc, pred)
+            # acc_steps[i + 1] = acc
+            # ind_pred = (pred == 0).nonzero().squeeze()
+            # x_best_adv[ind_pred] = x_adv[ind_pred] + 0.
+            
+            ### check step size
+            with torch.no_grad():
+                y1 = loss_indiv.detach().view(len(loss_indiv),-1).mean(dim=1)
+                loss_steps[i] = y1
+                ind = (y1 > loss_best).nonzero().squeeze()
+                x_best_adv[ind] = x_adv[ind] + 0.
+                x_best[ind] = x_adv[ind].clone()
+                grad_best[ind] = grad[ind].clone()
+                loss_best[ind] = y1[ind] + 0
+                loss_best_steps[i + 1] = loss_best + 0
+
+                counter3 += 1
+
+                if counter3 == k:
+                    fl_oscillation = check_oscillation(
+                        loss_steps, i, k, loss_best, device=device, k3=thr_decr
+                    )
+                    fl_reduce_no_impr = (1. - reduced_last_check) * (loss_best_last_check >= loss_best).float()
+                    fl_oscillation = torch.max(
+                        fl_oscillation,
+                        fl_reduce_no_impr
+                    )
+                    reduced_last_check = fl_oscillation.clone()
+                    loss_best_last_check = loss_best.clone()
+
+                    if fl_oscillation.sum() > 0:
+                        ind_fl_osc = (fl_oscillation > 0).nonzero().squeeze()
+                        step_size[ind_fl_osc] /= 2.0
+                        n_reduced = fl_oscillation.sum()
+
+                        x_adv[ind_fl_osc] = x_best[ind_fl_osc].clone()
+                        grad[ind_fl_osc] = grad_best[ind_fl_osc].clone()
+
+                    k = max(k - size_decr, n_iter_min)
+        
+                    counter3 = 0
+                    
+        return x_best_adv*255
+        
     def loss(self, inputs: Tensor, data_samples: SampleList) -> dict:
         """Calculate losses from a batch of inputs and data samples.
 
@@ -217,7 +470,108 @@ class EncoderDecoder(BaseSegmentor):
                     padding_size=[0, 0, 0, 0])
             ] * inputs.shape[0]
 
-        seg_logits = self.inference(inputs, batch_img_metas)
+        
+        #import ipdb;ipdb.set_trace()
+        #mean=[123.675, 116.28, 103.53]
+        #std=[58.395, 57.12, 57.375]
+        
+        normalize = torchvision.transforms.Normalize(mean = self.mean, std=self.std)
+        
+        
+        if self.perform_attack:
+            attack = Attack()
+            if self.attack_cfg['name']=='apgd':
+                inputs = self.apgd(model = self.inference, normalize_inputs=normalize, batch_img_metas = batch_img_metas, data_samples=data_samples, n_iter=self.attack_cfg['iterations'], x = inputs/255., y = data_samples[-1].gt_sem_seg, device = inputs.device, eps=self.attack_cfg['epsilon']/255.)
+            else:
+                orig_inputs = inputs.clone().detach()
+                
+                if 'pgd' in self.attack_cfg['name']:
+                    if self.attack_cfg['norm'] == 'linf':
+                        inputs = attack.init_linf(inputs, self.attack_cfg['epsilon'], clamp_min = 0, clamp_max=255)
+                    elif self.attack_cfg['norm'] == 'l2':
+                        inputs = attack.init_l2(inputs, self.attack_cfg['epsilon'], clamp_min = 0, clamp_max=255)
+                    else:
+                        raise NotImplementedError('Only linf and l2 norm implemented')                                               
+                
+                for itr in range(self.attack_cfg['iterations']):
+                    inputs.requires_grad = True
+                    
+                    self.zero_grad()
+                    
+                
+                    with torch.enable_grad():
+                        #import ipdb;ipdb.set_trace()
+                        seg_logits = self.inference(normalize(inputs), batch_img_metas)
+                        
+                        loss = self.loss(normalize(inputs), data_samples)['decode.loss_ce']
+
+                        #import ipdb;ipdb.set_trace()
+                        
+                        img_meta = batch_img_metas[0]
+                        batch_size, C, H, W = seg_logits.shape
+                        if 'img_padding_size' not in img_meta:
+                            padding_size = img_meta.get('padding_size', [0] * 4)
+                        else:
+                            padding_size = img_meta['img_padding_size']
+                        padding_left, padding_right, padding_top, padding_bottom =\
+                            padding_size
+                        # i_seg_logits shape is 1, C, H, W after remove padding
+                        i_seg_logits = seg_logits[:, :,
+                                                padding_top:H - padding_bottom,
+                                                padding_left:W - padding_right]
+                        
+                        resized_seg_logits = resize(
+                                        i_seg_logits,
+                                        size=batch_img_metas[0]['ori_shape'],
+                                        mode='bilinear',
+                                        align_corners=self.align_corners,
+                                        warning=False)#.squeeze(0)
+                        
+                        
+                        
+                        if self.attack_cfg['name'] == 'cospgd':
+                        
+                            with torch.no_grad():
+                                
+                                cossim = self.cospgd_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=False, one_hot=True)
+                            loss = cossim.detach() * loss
+                            #loss = self.cospgd_scale(seg_logits, gt, loss.clone(), num_classes=150, targeted=False, one_hot=True) * loss
+                        elif self.attack_cfg['name'] == 'segpgd':
+                            #print('USING SEGPGD!!!')
+                            loss = self.segpgd_scale(resized_seg_logits, data_samples[-1].gt_sem_seg.data, loss, iteration=itr, iterations=self.attack_cfg['iterations'], targeted=False)
+                            #loss = self.segpgd_scale(seg_logits, gt, loss, iteration=itr, iterations=self.attack_cfg['iterations'], targeted=False)
+                    
+                    
+                        #inputs_grad = torch.autograd.grad(loss.mean(), inputs)
+                        loss.mean().backward()
+                    
+                    if self.attack_cfg['norm'] == 'linf':
+                        inputs = attack.step_inf(inputs, self.attack_cfg['epsilon'], data_grad=inputs.grad, orig_image=orig_inputs, alpha=self.attack_cfg['alpha'], targeted=False, clamp_min = 0, clamp_max=255)
+                        #inputs = attack.step_inf(inputs, self.attack_cfg['epsilon'], data_grad=inputs_grad, orig_image=orig_inputs, alpha=self.attack_cfg['alpha'], targeted=False, clamp_min = 0, clamp_max=255)
+                    elif self.attack_cfg['norm'] == 'l2':
+                        inputs = attack.step_l2(inputs, self.attack_cfg['epsilon'], data_grad=inputs.grad, orig_image=orig_inputs, alpha=self.attack_cfg['alpha'], targeted=False, clamp_min = 0, clamp_max=255)
+                    else:
+                        raise NotImplementedError('Only linf and l2 norm implemented')
+        
+        seg_logits = self.inference(normalize(inputs), batch_img_metas)
+        #seg_logits = self.inference(inputs, batch_img_metas)
+        #data_samples[-1].gt_sem_seg.data   MODELS.build(CosPGD_loss_dict)   attack_cfg=dict(perform_attack=True, name='cospgd', iterations=3, epsilon=8,alpha=2.55, norm='linf')
+        
+        """
+        save_image__dir = "/home/sagnihot/projects/mmsegmentation/SAM_compare/{}".format(self.attack_cfg['name'])
+        os.makedirs(save_image__dir, exist_ok=True)
+        for i in range(len(inputs)):
+            img_id = self.counter
+            self.counter = self.counter + 1 
+            image = inputs[i].detach().cpu().numpy()
+            og_image = orig_inputs[i].detach().cpu().numpy()
+
+            image = image.transpose(1, 2, 0).astype(np.uint8)
+            og_image = og_image.transpose(1, 2, 0).astype(np.uint8)
+
+            Image.fromarray(image).save(save_image__dir + '/%d_attacked_image.png' % img_id)
+            Image.fromarray(og_image).save(save_image__dir + '/%d_orig_image.png' % img_id)
+        """
 
         return self.postprocess_result(seg_logits, data_samples)
 
@@ -235,6 +589,7 @@ class EncoderDecoder(BaseSegmentor):
         Returns:
             Tensor: Forward output of model without any post-processes.
         """
+        #x = self.normalize(x)
         x = self.extract_feat(inputs)
         return self.decode_head.forward(x)
 
